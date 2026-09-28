@@ -1,0 +1,123 @@
+name: OpenBench Fleet
+
+# Manual trigger for testing, plus a recurring cron so the fleet
+# relaunches itself before GitHub kills each job at the 6h hard cap.
+# Interval must be >= job timeout-minutes below, or you'll get overlapping
+# fleets fighting for the 20-job concurrency slot.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'
+
+# Prevents a stray manual dispatch from stacking on top of a cron-triggered
+# fleet that's already running.
+concurrency:
+  group: ob-fleet
+  cancel-in-progress: false
+
+jobs:
+  worker:
+    runs-on: ubuntu-latest
+    # Stay safely under GitHub's 360-minute hard limit so the client
+    # exits somewhat gracefully instead of being SIGKILLed mid-step.
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        # One entry per worker. GitHub's free-tier concurrency cap is 20
+        # jobs account-wide, so this matrix alone uses the whole budget —
+        # no need to split this across multiple repos.
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+
+    steps:
+      - name: Install build toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential python3 python3-pip git curl clang lld llvm
+
+      - name: Install Nim
+        run: |
+          curl https://nim-lang.org/choosenim/init.sh -sSf | sh -s -- -y
+          echo "$HOME/.nimble/bin" >> "$GITHUB_PATH"
+
+      - name: Verify Nim toolchain
+        run: |
+          nim --version
+          nimble --version
+
+      - name: Install Nim package dependencies
+        run: |
+          # Engines built via the OpenBench client get cloned into a fresh temp
+          # dir on every workload — we never touch that clone ourselves — so
+          # this has to install into the GLOBAL nimble cache (~/.nimble) ahead
+          # of time. That's why it works on Windows/MSYS2/your friend's Linux
+          # without anyone thinking about it: those machines already have
+          # nimsimd sitting in their nimble cache from some earlier install.
+          # A fresh GitHub Actions runner starts with an empty one every time.
+          nimble install -y nimsimd
+          # If GyatsoChess.nimble declares other `requires` beyond nimsimd,
+          # list them here too (or better: `nimble install -y` run against
+          # a checkout of the engine repo containing that .nimble file, which
+          # resolves everything it declares at once instead of one-by-one).
+
+      - name: Fetch OpenBench client
+        run: |
+          # Your own fork, pinned to master. Switch this to a specific tag/sha
+          # once things are stable so a future push to your fork can't silently
+          # break the whole fleet mid-run.
+          git clone https://github.com/GyatsoYT/GyatsoBench.git ob-client
+
+      - name: Install client Python requirements
+        working-directory: ob-client
+        run: |
+          if [ -f requirements.txt ]; then
+            pip3 install --break-system-packages -r requirements.txt
+          fi
+          # Always explicit, regardless of what requirements.txt does or doesn't
+          # list — worker.py hard-imports this and it's silently missing from
+          # your fork's requirements.txt right now.
+          pip3 install --break-system-packages py-cpuinfo requests psutil
+
+      - name: Locate client entrypoint
+        working-directory: ob-client
+        run: |
+          echo "---- repo root ----"
+          ls -la
+          echo "---- Client/ ----"
+          ls -la Client || true
+
+      - name: Run OpenBench worker
+        working-directory: ob-client/Client
+        env:
+          OB_USER: ${{ secrets.OB_USERNAME }}
+          OB_PASS: ${{ secrets.OB_PASSWORD }}
+          OB_SERVER: ${{ secrets.OB_SERVER }}
+          # Force Python to flush output immediately instead of block-buffering
+          # it (the default whenever stdout isn't a real terminal — i.e. always
+          # in CI). Without this, real progress can sit invisible in a buffer
+          # for minutes and look identical to "hung" even when it isn't.
+          PYTHONUNBUFFERED: "1"
+        run: |
+          ENTRY=$(ls client.py Client.py 2>/dev/null | head -n1)
+          if [ -z "$ENTRY" ]; then
+            echo "No client.py / Client.py found in Client/ — see the ls output"
+            echo "from the previous step and adjust working-directory above."
+            exit 1
+          fi
+          echo "Using entrypoint: $ENTRY"
+
+          # Detect actual core count instead of hardcoding a number — a private
+          # repo gets 2 vCPU standard runners, a public repo gets 4, and either
+          # way a wrong hardcoded value gets fastchess's own concurrency check
+          # to refuse outright ("Concurrency exceeds number of CPUs").
+          CORES=$(nproc)
+          echo "Detected $CORES CPU cores, using as -T"
+
+          # --no-client-downloads: every job already does a fresh git clone of
+          # the fork, so the client's self-update-and-restart mechanism (which
+          # is what was looping on "Downloading newer version of Client...")
+          # can never help here — it can only get stuck if the server's
+          # declared client_version doesn't match what's actually on master.
+          # Since we're always starting from current code anyway, just disable
+          # the self-update path entirely rather than chasing version drift.
+          python3 -u "$ENTRY" -U "$OB_USER" -P "$OB_PASS" -S "$OB_SERVER" -T "$CORES" -N 1 --no-client-downloads
