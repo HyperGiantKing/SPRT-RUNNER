@@ -120,4 +120,4 @@ jobs:
           # declared client_version doesn't match what's actually on master.
           # Since we're always starting from current code anyway, just disable
           # the self-update path entirely rather than chasing version drift.
-          python3 -u "$ENTRY" -U "$OB_USER" -P "$OB_PASS" -S "$OB_SERVER" -T 2 -N 1
+          python3 -u "$ENTRY" -U "$OB_USER" -P "$OB_PASS" -S "$OB_SERVER" -T 4 -N 1
